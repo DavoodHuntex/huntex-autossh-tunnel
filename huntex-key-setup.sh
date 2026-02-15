@@ -3,22 +3,17 @@ set -Eeuo pipefail
 
 # ==============================
 # HUNTEX Key Setup (HPN SSH)
-# - Generates a unique SSH key per IR server NAME
-# - Pushes pubkey to remote HPN SSH server (port 2222)
-# - Survives SSH disconnect by re-running via systemd-run
-# - Works correctly even when executed via: curl ... | bash
+# - Unique key per NAME
+# - Push pubkey to remote HPN SSH server
+# - Survives SSH disconnect using systemd-run
+# - SAFE with curl | bash (self-saves first)
 # ==============================
 
-# ---- Inputs (env overrides) ----
 IP="${IP:-45.144.55.47}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
 NAME="${NAME:-filestore-IR-01}"
-
-# Remote password (no prompt if provided)
 PASS="${PASS:-}"
-
-# If set to 1, wipes local key artifacts (scoped/safe)
 WIPE_KEYS="${WIPE_KEYS:-0}"
 
 SSH_DIR="/root/.ssh"
@@ -28,32 +23,23 @@ KNOWN="${SSH_DIR}/known_hosts_${NAME}"
 
 UNIT="huntex-key-setup-${NAME}"
 LOG="/var/log/huntex-key-setup_${NAME}.log"
+SAVED="/usr/local/bin/${UNIT}.sh"
 
-# ---- Helper: ensure we run from a real file (important for curl | bash) ----
-ensure_script_on_disk() {
-  # If already running from a regular file, keep it.
-  if [[ -f "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != "/dev/fd/"* ]]; then
-    echo "${BASH_SOURCE[0]}"
-    return 0
-  fi
+fatal() { echo "[FATAL] $*" >&2; exit 1; }
 
-  # We are likely running from stdin (curl | bash). Save ourselves to a file.
-  mkdir -p /usr/local/bin
-  local saved="/usr/local/bin/${UNIT}.sh"
-  cat >"$saved"
-  chmod 700 "$saved"
-  echo "$saved"
-}
+# ---- If executed via stdin (curl | bash), save to disk first ----
+if [[ ! -f "${BASH_SOURCE[0]}" || "${BASH_SOURCE[0]}" == "/dev/fd/"* ]]; then
+  mkdir -p /usr/local/bin /var/log
+  cat >"$SAVED"
+  chmod 700 "$SAVED"
+  exec /bin/bash -lc "IP='$IP' PORT='$PORT' USER='$USER' NAME='$NAME' PASS='$PASS' WIPE_KEYS='$WIPE_KEYS' '$SAVED'"
+fi
 
-# ---- Background mode (systemd-run) ----
+# ---- Run in background via systemd-run (survives SSH drop) ----
 if [[ -z "${HUNTEX_BG:-}" ]]; then
   mkdir -p /var/log
-
-  # Save script to disk if needed (so systemd can execute it)
-  SCRIPT_PATH="$(ensure_script_on_disk)"
-
   echo "[*] Re-running in background via systemd-run. Logs: ${LOG}"
-  # Stop any previous run for same unit (avoid duplicates)
+
   systemctl stop "${UNIT}.service" 2>/dev/null || true
   systemctl reset-failed "${UNIT}.service" 2>/dev/null || true
 
@@ -62,7 +48,7 @@ if [[ -z "${HUNTEX_BG:-}" ]]; then
       set -Eeuo pipefail
       export HUNTEX_BG=1
       export IP='${IP}' PORT='${PORT}' USER='${USER}' NAME='${NAME}' PASS='${PASS}' WIPE_KEYS='${WIPE_KEYS}'
-      /bin/bash '${SCRIPT_PATH}' >>'${LOG}' 2>&1
+      /bin/bash '${SAVED}' >>'${LOG}' 2>&1
     "
 
   echo "[+] Started. Follow logs:"
@@ -70,12 +56,15 @@ if [[ -z "${HUNTEX_BG:-}" ]]; then
   exit 0
 fi
 
-# ---- Actual work starts here ----
 echo "==== HUNTEX KEY SETUP (${NAME}) ===="
 echo "[i] IP=${IP} PORT=${PORT} USER=${USER}"
 echo "[i] KEY=${KEY}"
+echo "[i] KNOWN=${KNOWN}"
 
-# ---- Install required tools ----
+[[ -n "$KEY" ]] || fatal "KEY path is empty (bug)"
+[[ -n "$KNOWN" ]] || fatal "KNOWN path is empty (bug)"
+
+# ---- Install tools ----
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
 apt-get install -y openssh-client sshpass >/dev/null
@@ -84,32 +73,26 @@ apt-get install -y openssh-client sshpass >/dev/null
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-# ---- Optional: wipe key artifacts (SAFE & scoped) ----
+# ---- Optional wipe ----
 if [[ "$WIPE_KEYS" == "1" ]]; then
-  echo "[!] WIPE_KEYS=1 -> Removing key artifacts for this NAME only"
+  echo "[!] WIPE_KEYS=1 -> Removing artifacts for NAME=${NAME}"
   rm -f "$KEY" "$PUB" "$KNOWN" || true
-  # Also remove stale hashed hostkey entries (non-fatal if files missing)
-  ssh-keygen -R "[${IP}]:${PORT}" -f "$KNOWN" >/dev/null 2>&1 || true
 fi
 
-# ---- Generate fresh key for this NAME (always regenerate) ----
-echo "[*] Generating fresh key for NAME=${NAME}"
+# ---- Generate fresh key ----
+echo "[*] Generating fresh key..."
 rm -f "$KEY" "$PUB" || true
 ssh-keygen -t ed25519 -f "$KEY" -N "" -C "${NAME}@$(hostname)" >/dev/null
 
 chmod 600 "$KEY"
 chmod 644 "$PUB"
 
-# ---- Password handling ----
-if [[ -z "$PASS" ]]; then
-  echo "[FATAL] PASS is empty. Provide PASS env var (no prompt mode)."
-  echo "Example:"
-  echo "  IP='x.x.x.x' PORT='2222' USER='root' NAME='filestore-IR-01' PASS='YourPass' WIPE_KEYS='1' bash huntex-key-setup.sh"
-  exit 1
-fi
+[[ -f "$KEY" ]] || fatal "Key was not created: $KEY"
+[[ -f "$PUB" ]] || fatal "Pubkey was not created: $PUB"
+[[ -n "$PASS" ]] || fatal "PASS is empty (set PASS=...)"
 
-# ---- Push key to remote ----
-echo "[*] Sending key to remote via ssh-copy-id..."
+# ---- Push key ----
+echo "[*] Sending key via ssh-copy-id..."
 sshpass -p "$PASS" ssh-copy-id \
   -p "$PORT" \
   -i "$PUB" \
@@ -119,7 +102,7 @@ sshpass -p "$PASS" ssh-copy-id \
   -o PubkeyAuthentication=no \
   "${USER}@${IP}"
 
-# ---- Test key-only login (must NOT ask password) ----
+# ---- Test ----
 echo "[*] Testing key-only login..."
 ssh -p "$PORT" -i "$KEY" \
   -o StrictHostKeyChecking=no \
