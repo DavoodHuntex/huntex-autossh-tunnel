@@ -1,160 +1,139 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ==============================
-# HUNTEX Key Setup (HPN SSH)
-# - Generates a unique SSH key per IR server NAME
-# - Pushes pubkey to remote HPN SSH server (port 2222)
-# - Survives SSH disconnect via systemd-run
-# - Fixes HOME issues inside systemd-run (ssh-copy-id mktemp bug)
-# - Has a safe fallback (manual authorized_keys append) if ssh-copy-id fails
-# ==============================
+# ==========================================================
+# HUNTEX Key Setup (HPN SSH) - FINAL
+# - Works with BOTH:
+#     1) curl ... | bash
+#     2) curl -o file && chmod +x && ./file
+# - Survives SSH disconnect by re-running via systemd-run
+# - ALWAYS resets (deletes + recreates) keypair for this NAME
+# - Pushes pubkey WITHOUT ssh-copy-id (no mktemp/~/.ssh issues)
+# ==========================================================
 
-ts() { date '+%F %T'; }
-log() { echo "[$(ts)] $*"; }
-die() { log "[FATAL] $*"; exit 1; }
+ts(){ date '+%F %T'; }
+log(){ echo "[$(ts)] $*"; }
+die(){ log "[FATAL] $*"; exit 1; }
 
-# ---- Inputs (env overrides) ----
-IP="${IP:-45.144.55.47}"
+# ---------------- Inputs (env) ----------------
+IP="${IP:-}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
-NAME="${NAME:-filestore-IR-01}"
-PASS="${PASS:-}"
-WIPE_KEYS="${WIPE_KEYS:-0}"
+NAME="${NAME:-}"
+PASS="${PASS:-}"             # required (no prompt)
+WIPE_KEYS="${WIPE_KEYS:-0}"  # 1 => remove only this NAME artifacts (safe)
 
-# Always force correct HOME (critical for ssh-copy-id under systemd-run)
-export HOME="/root"
-
+# ---------------- Paths ----------------
 SSH_DIR="/root/.ssh"
 KEY="${SSH_DIR}/id_ed25519_${NAME}"
 PUB="${KEY}.pub"
 KNOWN="${SSH_DIR}/known_hosts_${NAME}"
-LOG_FILE="/var/log/huntex-key-setup_${NAME}.log"
+LOGFILE="/var/log/huntex-key-setup_${NAME}.log"
 
-# Figure out the real script path (works when executed from file)
-SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+# ---------------- Validate ----------------
+[[ -n "$IP" ]]   || die "IP is required"
+[[ -n "$NAME" ]] || die "NAME is required"
+[[ -n "$PASS" ]] || die "PASS is required (no prompt mode)"
 
-# ---- Run in background via systemd-run (survives SSH drop) ----
+# ---------------- Self materialization (pipe-safe) ----------------
+# If invoked via pipe (curl | bash), $0 is "bash". We MUST save script to a file.
+SELF="${SELF_PATH:-}"
+if [[ -z "$SELF" ]]; then
+  if [[ "${0##*/}" == "bash" || "${0##*/}" == "sh" || ! -f "$0" ]]; then
+    SELF="/tmp/huntex-key-setup.$$.sh"
+    cat >"$SELF"
+    chmod +x "$SELF"
+    export SELF_PATH="$SELF"
+    exec "$SELF"
+  else
+    SELF="$0"
+    export SELF_PATH="$SELF"
+  fi
+fi
+
+# ---------------- Run in background (systemd-run) ----------------
 if [[ -z "${HUNTEX_BG:-}" ]]; then
   mkdir -p /var/log
-  log "[*] Re-running in background via systemd-run. Logs: ${LOG_FILE}"
+  log "[*] Re-running in background via systemd-run. Logs: ${LOGFILE}"
 
-  # If script was piped (no real file), write a temp copy and run that
-  if [[ -z "${SELF_PATH}" || ! -f "${SELF_PATH}" ]]; then
-    TMP_SELF="/root/.cache/huntex-key-setup_${NAME}.sh"
-    mkdir -p /root/.cache
-    # Try to reconstruct from stdin if available
-    if [[ ! -t 0 ]]; then
-      cat >"$TMP_SELF"
-      chmod +x "$TMP_SELF"
-      SELF_PATH="$TMP_SELF"
-    else
-      die "Cannot determine script path. Please run from a file: curl -o /root/huntex-key-setup.sh ..."
-    fi
-  fi
-
+  # Run exactly the saved file (SELF_PATH), not "$0"
   systemd-run --unit="huntex-key-setup-${NAME}" --collect --quiet \
     /usr/bin/env \
-      HOME="/root" \
+      HOME=/root \
       IP="$IP" PORT="$PORT" USER="$USER" NAME="$NAME" PASS="$PASS" WIPE_KEYS="$WIPE_KEYS" \
-      HUNTEX_BG="1" \
-      bash -lc "\"$SELF_PATH\" >>\"$LOG_FILE\" 2>&1"
+      HUNTEX_BG=1 SELF_PATH="$SELF" \
+    /bin/bash -lc "'$SELF' >>'$LOGFILE' 2>&1" \
+    || die "systemd-run failed"
 
   log "[+] Started. Follow logs:"
-  log "    tail -f ${LOG_FILE}"
+  log "    tail -f ${LOGFILE}"
   exit 0
 fi
 
+# ===================== Real work (background) =====================
 log "==== HUNTEX KEY SETUP (${NAME}) ===="
 log "[i] IP=${IP} PORT=${PORT} USER=${USER}"
-log "[i] KEY=${KEY}"
 log "[i] HOME=${HOME}"
+log "[i] KEY=${KEY}"
 
-[[ -n "$PASS" ]] || die "PASS is empty. Provide PASS env var (no prompt mode)."
-
-# ---- Install required tools ----
-if ! command -v sshpass >/dev/null 2>&1 || ! command -v ssh >/dev/null 2>&1; then
-  log "[*] Installing deps (sshpass, openssh-client)..."
+# Tools
+if ! command -v sshpass >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+  log "[*] Installing deps..."
   apt-get update -y
   apt-get install -y sshpass openssh-client
 fi
 
-# ---- Ensure SSH dir ----
+# Ensure /root & ssh dir
+mkdir -p /root
+chmod 700 /root || true
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-# ---- Optional: wipe old key artifacts for THIS NAME only ----
+# Optional wipe (SAFE): only this NAME artifacts
 if [[ "$WIPE_KEYS" == "1" ]]; then
-  log "[!] WIPE_KEYS=1 -> Removing key artifacts for this NAME only"
+  log "[!] WIPE_KEYS=1 -> Removing ONLY this NAME key artifacts"
   rm -f "$KEY" "$PUB" "$KNOWN" || true
-  rm -f "${SSH_DIR}/ssh-copy-id."* 2>/dev/null || true
 fi
 
-# ---- Generate fresh key (always regenerate for this NAME) ----
-log "[*] Generating fresh key for NAME=${NAME}"
+# Always reset keypair for NAME (this guarantees script #2 consistency)
+log "[*] Resetting keypair for NAME=${NAME} (delete + create fresh)"
 rm -f "$KEY" "$PUB" || true
-ssh-keygen -t ed25519 -f "$KEY" -N "" -C "${NAME}@$(hostname)" >/dev/null
-
+ssh-keygen -t ed25519 -f "$KEY" -N "" -C "${NAME}@$(hostname)"
 chmod 600 "$KEY"
 chmod 644 "$PUB"
 
-[[ -s "$KEY" ]] || die "Key generation failed (missing: $KEY)"
-[[ -s "$PUB" ]] || die "Key generation failed (missing: $PUB)"
+# Push key without ssh-copy-id
+log "[*] Pushing public key to remote authorized_keys (password auth)"
+PUB_LINE="$(cat "$PUB")"
 
-# ---- SSH common options ----
-SSH_OPTS=(
-  -p "$PORT"
-  -o "StrictHostKeyChecking=accept-new"
-  -o "UserKnownHostsFile=$KNOWN"
-  -o "ConnectTimeout=10"
-  -o "ConnectionAttempts=3"
-)
-
-# ---- Try ssh-copy-id first (with correct HOME) ----
-log "[*] Sending key to remote (ssh-copy-id)..."
-set +e
-HOME="/root" sshpass -p "$PASS" ssh-copy-id \
-  -p "$PORT" \
-  -i "$PUB" \
-  -o StrictHostKeyChecking=accept-new \
+sshpass -p "$PASS" ssh -p "$PORT" \
+  -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile="$KNOWN" \
   -o PreferredAuthentications=password \
   -o PubkeyAuthentication=no \
-  "${USER}@${IP}"
-RC=$?
-set -e
+  -o PasswordAuthentication=yes \
+  -o KbdInteractiveAuthentication=no \
+  "${USER}@${IP}" \
+  "set -e
+   umask 077
+   mkdir -p ~/.ssh
+   chmod 700 ~/.ssh
+   touch ~/.ssh/authorized_keys
+   chmod 600 ~/.ssh/authorized_keys
+   grep -qxF '$PUB_LINE' ~/.ssh/authorized_keys || echo '$PUB_LINE' >> ~/.ssh/authorized_keys
+   echo REMOTE_KEY_INSTALLED"
 
-if [[ $RC -ne 0 ]]; then
-  log "[!] ssh-copy-id failed (rc=$RC) -> fallback to manual authorized_keys append"
-
-  PUB_B64="$(base64 -w0 "$PUB")"
-  REMOTE_CMD=$'set -euo pipefail\n'\
-$'export HOME=/root\n'\
-$'mkdir -p /root/.ssh\n'\
-$'chmod 700 /root/.ssh\n'\
-$'touch /root/.ssh/authorized_keys\n'\
-$'chmod 600 /root/.ssh/authorized_keys\n'\
-$'KEY_LINE="$(echo '"$PUB_B64"' | base64 -d)"\n'\
-$'grep -qxF "$KEY_LINE" /root/.ssh/authorized_keys || echo "$KEY_LINE" >> /root/.ssh/authorized_keys\n'\
-$'echo "MANUAL_KEY_OK"\n'
-
-  sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" \
-    -o "PreferredAuthentications=password" \
-    -o "PubkeyAuthentication=no" \
-    "${USER}@${IP}" "bash -lc $(printf '%q' "$REMOTE_CMD")" \
-    || die "Manual key install failed"
-fi
-
-# ---- Test key-only login (must NOT ask password) ----
-log "[*] Testing key-only login..."
-ssh "${SSH_OPTS[@]}" -i "$KEY" \
-  -o "PreferredAuthentications=publickey" \
-  -o "PubkeyAuthentication=yes" \
-  -o "PasswordAuthentication=no" \
-  -o "KbdInteractiveAuthentication=no" \
-  -o "IdentitiesOnly=yes" \
-  "${USER}@${IP}" "echo KEY_OK_FROM_${NAME}" \
-  || die "Key-only login test failed"
+# Test key-only login
+log "[*] Testing key-only login (must not prompt password)"
+ssh -p "$PORT" -i "$KEY" \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile="$KNOWN" \
+  -o PreferredAuthentications=publickey \
+  -o PubkeyAuthentication=yes \
+  -o PasswordAuthentication=no \
+  -o KbdInteractiveAuthentication=no \
+  -o IdentitiesOnly=yes \
+  "${USER}@${IP}" "echo KEY_OK_FROM_${NAME}"
 
 log "[+] DONE"
-log "[+] KEY PATH: $KEY"
+log "[+] KEY PATH: ${KEY}"
