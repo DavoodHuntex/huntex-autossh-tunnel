@@ -3,18 +3,11 @@ set -Eeuo pipefail
 
 # ============================================================
 # HUNTEX Key Setup (HPN SSH)
-# - Works with both: curl | bash   AND   downloaded file
-# - Creates a unique ED25519 key for this IR server (NAME)
-# - Pushes pubkey to remote HPN SSH server (IP:PORT)
-# - Optional detached run via systemd-run to survive SSH drop
-#
-# ENV:
-#   IP, PORT, USER, NAME, PASS
-#   WIPE_KEYS=0/1     (remove only this NAME artifacts)
-#   FORCE_FG=0/1      (disable systemd-run)
+# - Safe with WIPE_KEYS=1 (only wipes this NAME artifacts)
+# - Fixes ssh-copy-id mktemp failure by enforcing ~/.ssh and TMPDIR=/tmp
+# - Can run detached via systemd-run (survives SSH disconnect)
 # ============================================================
 
-# -------- Inputs (env overrides) --------
 IP="${IP:-45.144.55.47}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
@@ -23,7 +16,6 @@ PASS="${PASS:-}"
 WIPE_KEYS="${WIPE_KEYS:-0}"
 FORCE_FG="${FORCE_FG:-0}"
 
-# -------- Paths --------
 SSH_DIR="/root/.ssh"
 KEY="${SSH_DIR}/id_ed25519_${NAME}"
 PUB="${KEY}.pub"
@@ -33,23 +25,21 @@ UNIT="huntex-key-setup-${NAME}"
 LOG="/var/log/huntex-key-setup_${NAME}.log"
 STAGED="/usr/local/bin/${UNIT}.sh"
 
-# -------- Helpers --------
 ts(){ date "+%F %T"; }
 log(){ echo "[$(ts)] $*"; }
 warn(){ echo "[$(ts)] [WARN] $*" >&2; }
 die(){ echo "[$(ts)] [FATAL] $*" >&2; exit 1; }
-
 need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 
-# Avoid running from deleted cwd (you had rm -rf /root/.ssh while being inside it)
-safe_cwd(){ cd / || true; cd /root || true; }
+safe_cwd(){ cd /root 2>/dev/null || cd / || true; }
 
 try(){ set +e; "$@"; local rc=$?; set -e; return $rc; }
 
-ensure_dirs(){
-  mkdir -p /var/log >/dev/null 2>&1 || true
+ensure_ssh_dir(){
   mkdir -p "$SSH_DIR"
   chmod 700 "$SSH_DIR" || true
+  # Ensure root owns it (common after accidental deletes/recreates)
+  chown root:root "$SSH_DIR" || true
 }
 
 install_tools(){
@@ -57,18 +47,68 @@ install_tools(){
   apt-get update -y >/dev/null 2>&1 || true
   apt-get install -y openssh-client sshpass >/dev/null 2>&1 || true
   command -v sshpass >/dev/null 2>&1 || die "sshpass install failed"
-  command -v ssh-copy-id >/dev/null 2>&1 || die "ssh-copy-id missing (openssh-client failed?)"
+  command -v ssh-copy-id >/dev/null 2>&1 || die "ssh-copy-id missing"
   command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen missing"
 }
 
-wipe_name_artifacts(){
-  log "[!] WIPE_KEYS=1 -> wiping artifacts for this NAME only"
+stage_self(){
+  mkdir -p /var/log >/dev/null 2>&1 || true
+  safe_cwd
+
+  local src="${BASH_SOURCE[0]:-}"
+  if [[ -z "$src" || "$src" == "/dev/fd/"* || "$src" == "/proc/"* || ! -f "$src" ]]; then
+    log "[*] Running from stdin -> staging to $STAGED"
+    mkdir -p /usr/local/bin >/dev/null 2>&1 || true
+    cat >"$STAGED"
+    chmod 700 "$STAGED"
+    exec /usr/bin/env bash "$STAGED"
+  fi
+
+  mkdir -p /usr/local/bin >/dev/null 2>&1 || true
+  cp -f "$src" "$STAGED" 2>/dev/null || true
+  chmod 700 "$STAGED" 2>/dev/null || true
+}
+
+maybe_background(){
+  if [[ "${HUNTEX_BG:-0}" == "1" ]]; then return 0; fi
+  if [[ "$FORCE_FG" == "1" ]]; then return 0; fi
+
+  if command -v systemd-run >/dev/null 2>&1; then
+    mkdir -p /var/log >/dev/null 2>&1 || true
+    safe_cwd
+
+    try systemctl stop "${UNIT}.service" >/dev/null 2>&1 || true
+    try systemctl reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
+
+    log "[*] Re-running in background via systemd-run. Logs: $LOG"
+
+    systemd-run --unit="$UNIT" --collect --quiet \
+      /usr/bin/env bash -c "
+        set -Eeuo pipefail
+        export HUNTEX_BG=1 FORCE_FG=1
+        export IP='${IP}' PORT='${PORT}' USER='${USER}' NAME='${NAME}' PASS='${PASS}' WIPE_KEYS='${WIPE_KEYS}'
+        cd /root || true
+        /usr/bin/env bash '${STAGED}' >>'${LOG}' 2>&1
+      " || warn "systemd-run failed, continuing in foreground..."
+
+    if systemctl is-active --quiet "${UNIT}.service" 2>/dev/null; then
+      echo "[+] Started. Follow logs:"
+      echo "    tail -f ${LOG}"
+      exit 0
+    fi
+  fi
+}
+
+wipe_name_only(){
+  log "[!] WIPE_KEYS=1 -> Removing key artifacts for this NAME only"
   rm -f "$KEY" "$PUB" "$KNOWN" 2>/dev/null || true
+  # Do NOT touch other keys or the directory itself
 }
 
 generate_key(){
+  ensure_ssh_dir
   rm -f "$KEY" "$PUB" 2>/dev/null || true
-  log "[*] Generating key: $KEY"
+  log "[*] Generating fresh key for NAME=${NAME}"
   ssh-keygen -t ed25519 -f "$KEY" -N "" -C "${NAME}@$(hostname)" >/dev/null 2>&1 \
     || die "ssh-keygen failed"
   chmod 600 "$KEY" || true
@@ -78,8 +118,13 @@ generate_key(){
 }
 
 push_key(){
-  [[ -n "$PASS" ]] || die "PASS is empty. Provide PASS=... (no prompt)."
-  log "[*] Pushing pubkey to ${USER}@${IP}:${PORT}"
+  [[ -n "$PASS" ]] || die "PASS is empty. Provide PASS=..."
+  ensure_ssh_dir
+
+  # ssh-copy-id uses mktemp under ~/.ssh on some distros -> force TMPDIR
+  export TMPDIR="/tmp"
+
+  log "[*] Sending key to remote via ssh-copy-id..."
   sshpass -p "$PASS" ssh-copy-id \
     -p "$PORT" \
     -i "$PUB" \
@@ -88,10 +133,11 @@ push_key(){
     -o PreferredAuthentications=password \
     -o PubkeyAuthentication=no \
     "${USER}@${IP}" >/dev/null 2>&1 \
-    || die "ssh-copy-id failed (wrong PASS/IP/PORT or remote down)."
+    || die "ssh-copy-id failed"
 }
 
 test_key(){
+  ensure_ssh_dir
   log "[*] Testing key-only login..."
   ssh -p "$PORT" -i "$KEY" \
     -o StrictHostKeyChecking=no \
@@ -104,68 +150,7 @@ test_key(){
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=2 \
     "${USER}@${IP}" "echo KEY_OK_FROM_${NAME}" >/dev/null 2>&1 \
-    || die "Key-only test failed (publickey not accepted)."
-}
-
-# -------- Stage self for curl|bash --------
-stage_self(){
-  ensure_dirs
-  safe_cwd
-
-  # If running from stdin (curl|bash), we must materialize script to disk.
-  local src="${BASH_SOURCE[0]:-}"
-  if [[ -z "$src" || "$src" == "/dev/fd/"* || "$src" == "/proc/"* || ! -f "$src" ]]; then
-    log "[*] Running from stdin -> staging to $STAGED"
-    cat >"$STAGED"
-    chmod 700 "$STAGED"
-    exec /usr/bin/env bash "$STAGED"
-  fi
-
-  # If running from file, keep a copy at STAGED (for systemd-run reliability)
-  cp -f "$src" "$STAGED" 2>/dev/null || true
-  chmod 700 "$STAGED" 2>/dev/null || true
-}
-
-# -------- Background via systemd-run (safe) --------
-maybe_background(){
-  # already background?
-  if [[ "${HUNTEX_BG:-0}" == "1" ]]; then return 0; fi
-  # forced foreground?
-  if [[ "$FORCE_FG" == "1" ]]; then
-    warn "FORCE_FG=1 -> running in foreground."
-    return 0
-  fi
-
-  if command -v systemd-run >/dev/null 2>&1; then
-    ensure_dirs
-    safe_cwd
-
-    # stop old unit if exists
-    try systemctl stop "${UNIT}.service" >/dev/null 2>&1 || true
-    try systemctl reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
-
-    log "[*] Re-running in background via systemd-run. Logs: $LOG"
-
-    # NOTE: This is the critical part: we run the staged script file, not $0.
-    systemd-run --unit="$UNIT" --collect --quiet \
-      /usr/bin/env bash -c "
-        set -Eeuo pipefail
-        export HUNTEX_BG=1
-        export FORCE_FG=1
-        export IP='${IP}' PORT='${PORT}' USER='${USER}' NAME='${NAME}' PASS='${PASS}' WIPE_KEYS='${WIPE_KEYS}'
-        cd /root || true
-        /usr/bin/env bash '${STAGED}' >>'${LOG}' 2>&1
-      " || warn "systemd-run failed, continuing in foreground..."
-
-    # if unit started, exit now
-    if systemctl is-active --quiet "${UNIT}.service" 2>/dev/null; then
-      echo "[+] Started. Follow logs:"
-      echo "    tail -f ${LOG}"
-      exit 0
-    fi
-  fi
-
-  warn "systemd-run unavailable/failed -> running in foreground."
+    || die "Key-only test failed"
 }
 
 main(){
@@ -174,24 +159,16 @@ main(){
   stage_self
   maybe_background
 
-  # foreground work (or inside systemd-run)
-  ensure_dirs
-
   log "==== HUNTEX KEY SETUP (${NAME}) ===="
   log "[i] IP=${IP} PORT=${PORT} USER=${USER}"
   log "[i] KEY=${KEY}"
-  log "[i] KNOWN=${KNOWN}"
-  log "[i] WIPE_KEYS=${WIPE_KEYS}"
-
-  [[ -n "$IP" ]] || die "IP empty"
-  [[ -n "$PORT" ]] || die "PORT empty"
-  [[ -n "$USER" ]] || die "USER empty"
-  [[ -n "$NAME" ]] || die "NAME empty"
 
   install_tools
+  ensure_ssh_dir
 
   if [[ "$WIPE_KEYS" == "1" ]]; then
-    wipe_name_artifacts
+    wipe_name_only
+    ensure_ssh_dir
   fi
 
   generate_key
