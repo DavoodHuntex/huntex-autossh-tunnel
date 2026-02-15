@@ -1,127 +1,96 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ts(){ date '+%F %T'; }
-log(){ echo "[$(ts)] $*"; }
-die(){ log "[FATAL] $*"; exit 1; }
-
-# ---------------- Inputs ----------------
-IP="${IP:-}"
+# Inputs (env override friendly)
+IP="${IP:-45.144.55.47}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
-NAME="${NAME:-}"
-PASS="${PASS:-}"
-WIPE_KEYS="${WIPE_KEYS:-0}"
+NAME="${NAME:-filestore-IR-01}"
+PASS="${PASS:-}"                 # MUST be provided for non-interactive runs
+WIPE_THIS_NAME="${WIPE_THIS_NAME:-1}"
 
-UNIT="huntex-key-setup-${NAME}"
+export HOME="${HOME:-/root}"
 
 SSH_DIR="/root/.ssh"
 KEY="${SSH_DIR}/id_ed25519_${NAME}"
 PUB="${KEY}.pub"
 KNOWN="${SSH_DIR}/known_hosts_${NAME}"
-LOGFILE="/var/log/huntex-key-setup_${NAME}.log"
 
-[[ -n "$IP" ]]   || die "IP is required"
-[[ -n "$NAME" ]] || die "NAME is required"
-[[ -n "$PASS" ]] || die "PASS is required"
+echo "==== HUNTEX KEY RESET (${NAME}) ===="
+echo "[i] IP=${IP} PORT=${PORT} USER=${USER}"
+echo "[i] KEY=${KEY}"
 
-# ---------------- Pipe-safe self-save ----------------
-SELF="${SELF_PATH:-}"
-
-if [[ -z "$SELF" ]]; then
-  if [[ "${0##*/}" == "bash" || ! -f "$0" ]]; then
-    SELF="/tmp/huntex-key-setup.$$.sh"
-    cat >"$SELF"
-    chmod +x "$SELF"
-    export SELF_PATH="$SELF"
-    exec "$SELF"
-  else
-    SELF="$0"
-    export SELF_PATH="$SELF"
-  fi
-fi
-
-# ---------------- Background via systemd ----------------
-if [[ -z "${HUNTEX_BG:-}" ]]; then
-
-  log "[*] Preparing systemd unit cleanup..."
-
-  # ✅ FIX: Kill old transient unit if exists
-  if systemctl list-units --all | grep -q "${UNIT}.service"; then
-    log "[!] Old unit detected → cleaning..."
-
-    systemctl stop "${UNIT}.service" 2>/dev/null || true
-    systemctl reset-failed "${UNIT}.service" 2>/dev/null || true
-  fi
-
-  mkdir -p /var/log
-
-  log "[*] Re-running in background. Logs → ${LOGFILE}"
-
-  systemd-run --unit="${UNIT}" --collect --quiet \
-    /usr/bin/env \
-      HOME=/root \
-      IP="$IP" PORT="$PORT" USER="$USER" NAME="$NAME" PASS="$PASS" WIPE_KEYS="$WIPE_KEYS" \
-      HUNTEX_BG=1 SELF_PATH="$SELF" \
-    /bin/bash -lc "'$SELF' >>'$LOGFILE' 2>&1" \
-    || die "systemd-run failed"
-
-  log "[+] Started"
-  log "    tail -f ${LOGFILE}"
-  exit 0
-fi
-
-# ================= REAL EXECUTION =================
-
-log "==== HUNTEX KEY SETUP (${NAME}) ===="
-log "[i] IP=${IP} PORT=${PORT}"
-log "[i] KEY=${KEY}"
-
-# Deps
+# Tools
 if ! command -v sshpass >/dev/null 2>&1; then
-  log "[*] Installing deps..."
   apt-get update -y
   apt-get install -y sshpass openssh-client
 fi
 
+# SSH dir
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-if [[ "$WIPE_KEYS" == "1" ]]; then
-  log "[!] Removing old key artifacts for NAME only"
+# Safety: only wipe THIS NAME artifacts (not all keys!)
+if [[ "$WIPE_THIS_NAME" == "1" ]]; then
   rm -f "$KEY" "$PUB" "$KNOWN" || true
 fi
 
-log "[*] Resetting keypair"
-rm -f "$KEY" "$PUB" || true
-
+# Generate fresh key
 ssh-keygen -t ed25519 -f "$KEY" -N "" -C "${NAME}@$(hostname)"
-
 chmod 600 "$KEY"
 chmod 644 "$PUB"
 
-PUB_LINE="$(cat "$PUB")"
+# PASS required for non-interactive
+if [[ -z "$PASS" ]]; then
+  echo "[FATAL] PASS is empty. Run like:"
+  echo "PASS='YourPass' IP='x.x.x.x' PORT='2222' USER='root' NAME='${NAME}' bash $0"
+  exit 1
+fi
 
-log "[*] Installing key on remote"
-
-sshpass -p "$PASS" ssh -p "$PORT" \
-  -o StrictHostKeyChecking=no \
+# Install pubkey on remote (NO ssh-copy-id)
+echo "[*] Installing key on remote (append to authorized_keys)..."
+timeout 25 sshpass -p "$PASS" ssh \
+  -p "$PORT" \
+  -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile="$KNOWN" \
   -o PreferredAuthentications=password \
   -o PubkeyAuthentication=no \
+  -o PasswordAuthentication=yes \
+  -o KbdInteractiveAuthentication=no \
+  -o ConnectTimeout=10 \
+  -o ConnectionAttempts=2 \
   "${USER}@${IP}" \
-  "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
-   touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && \
-   grep -qxF '$PUB_LINE' ~/.ssh/authorized_keys || echo '$PUB_LINE' >> ~/.ssh/authorized_keys"
+  'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
 
-log "[*] Testing key login"
+# Append key (idempotent-ish: avoid duplicates)
+PUBKEY_LINE="$(cat "$PUB")"
+timeout 25 sshpass -p "$PASS" ssh \
+  -p "$PORT" \
+  -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile="$KNOWN" \
+  -o PreferredAuthentications=password \
+  -o PubkeyAuthentication=no \
+  -o PasswordAuthentication=yes \
+  -o KbdInteractiveAuthentication=no \
+  -o ConnectTimeout=10 \
+  -o ConnectionAttempts=2 \
+  "${USER}@${IP}" \
+  "grep -qxF '$PUBKEY_LINE' ~/.ssh/authorized_keys || echo '$PUBKEY_LINE' >> ~/.ssh/authorized_keys"
 
-ssh -p "$PORT" -i "$KEY" \
-  -o StrictHostKeyChecking=no \
+# Test key-only login
+echo "[*] Testing key-only login..."
+timeout 20 ssh \
+  -p "$PORT" -i "$KEY" \
+  -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile="$KNOWN" \
   -o PreferredAuthentications=publickey \
+  -o PubkeyAuthentication=yes \
   -o PasswordAuthentication=no \
+  -o KbdInteractiveAuthentication=no \
+  -o IdentitiesOnly=yes \
+  -o ConnectTimeout=10 \
+  -o ConnectionAttempts=2 \
   "${USER}@${IP}" "echo KEY_OK_FROM_${NAME}"
 
-log "[+] DONE"
-log "[+] KEY PATH → ${KEY}"
+echo "[+] DONE"
+echo "[+] KEY PATH: $KEY"
